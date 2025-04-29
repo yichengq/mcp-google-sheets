@@ -6,11 +6,13 @@ A Model Context Protocol (MCP) server built with FastMCP for interacting with Go
 
 import base64
 import os
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
 import json
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
+from datetime import datetime
 
 # MCP imports
 from mcp.server.fastmcp import FastMCP, Context
@@ -22,13 +24,17 @@ from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
+from .local_auth import LocalAuthClient
+
 # Constants
+SERVICE_NAME = os.environ.get('SERVICE_NAME', 'google_sheets')
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 CREDENTIALS_CONFIG = os.environ.get('CREDENTIALS_CONFIG')
 TOKEN_PATH = os.environ.get('TOKEN_PATH', 'token.json')
 CREDENTIALS_PATH = os.environ.get('CREDENTIALS_PATH', 'credentials.json')
 SERVICE_ACCOUNT_PATH = os.environ.get('SERVICE_ACCOUNT_PATH', 'service_account.json')
 DRIVE_FOLDER_ID = os.environ.get('DRIVE_FOLDER_ID', '')  # Working directory in Google Drive
+USER_ID = os.environ.get('USER_ID')
 
 @dataclass
 class SpreadsheetContext:
@@ -97,10 +103,27 @@ async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetCont
         pass
 
 
+def create_sheets_service():
+    """Create a new Gmail service instance for this request"""
+    credentials = LocalAuthClient().get_user_credentials(SERVICE_NAME, USER_ID)
+    if not credentials:
+        raise ValueError(f"NO CREDENTIALS FOUND FOR USER {USER_ID}")
+    expiry_datetime = datetime.strptime(credentials["expiry"], "%Y-%m-%dT%H:%M:%S.%fZ")
+    return build("sheets", "v4", credentials=Credentials(token=credentials["token"], expiry=expiry_datetime))
+
+
+def create_drive_service():
+    """Create a new Drive service instance for this request"""
+    credentials = LocalAuthClient().get_user_credentials(SERVICE_NAME, USER_ID)
+    if not credentials:
+        raise ValueError(f"NO CREDENTIALS FOUND FOR USER {USER_ID}")
+    expiry_datetime = datetime.strptime(credentials["expiry"], "%Y-%m-%dT%H:%M:%S.%fZ")
+    return build("drive", "v3", credentials=Credentials(token=credentials["token"], expiry=expiry_datetime))
+
+
 # Initialize the MCP server with lifespan management
 mcp = FastMCP("Google Spreadsheet", 
-              dependencies=["google-auth", "google-auth-oauthlib", "google-api-python-client"],
-              lifespan=spreadsheet_lifespan)
+              dependencies=["google-auth", "google-auth-oauthlib", "google-api-python-client"])
 
 
 @mcp.tool()
@@ -119,7 +142,7 @@ def get_sheet_data(spreadsheet_id: str,
     Returns:
         A 2D array of the sheet data
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = create_sheets_service()
     
     # Construct the range
     if range:
@@ -156,7 +179,7 @@ def update_cells(spreadsheet_id: str,
     Returns:
         Result of the update operation
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = create_sheets_service()
     
     # Construct the range
     full_range = f"{sheet}!{range}"
@@ -194,7 +217,7 @@ def batch_update_cells(spreadsheet_id: str,
     Returns:
         Result of the batch update operation
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = create_sheets_service()
     
     # Prepare the batch update request
     data = []
@@ -237,7 +260,7 @@ def add_rows(spreadsheet_id: str,
     Returns:
         Result of the operation
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = create_sheets_service()
     
     # Get sheet ID
     spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
@@ -295,7 +318,7 @@ def add_columns(spreadsheet_id: str,
     Returns:
         Result of the operation
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = create_sheets_service()
     
     # Get sheet ID
     spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
@@ -346,7 +369,7 @@ def list_sheets(spreadsheet_id: str, ctx: Context = None) -> List[str]:
     Returns:
         List of sheet names
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = create_sheets_service()
     
     # Get spreadsheet metadata
     spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
@@ -375,7 +398,7 @@ def copy_sheet(src_spreadsheet: str,
     Returns:
         Result of the operation
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = create_sheets_service()
     
     # Get source sheet ID
     src = sheets_service.spreadsheets().get(spreadsheetId=src_spreadsheet).execute()
@@ -447,7 +470,7 @@ def rename_sheet(spreadsheet: str,
     Returns:
         Result of the operation
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = create_sheets_service()
     
     # Get sheet ID
     spreadsheet_data = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet).execute()
@@ -501,7 +524,7 @@ def get_multiple_sheet_data(queries: List[Dict[str, str]],
         A list of dictionaries, each containing the original query parameters 
         and the fetched 'data' or an 'error'.
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = create_sheets_service()
     results = []
     
     for query in queries:
@@ -549,7 +572,7 @@ def get_multiple_spreadsheet_summary(spreadsheet_ids: List[str],
         A list of dictionaries, each representing a spreadsheet summary. 
         Includes spreadsheet title, sheet summaries (title, headers, first rows), or an error.
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = create_sheets_service()
     summaries = []
     
     for spreadsheet_id in spreadsheet_ids:
@@ -633,9 +656,9 @@ def get_spreadsheet_info(spreadsheet_id: str) -> str:
     Returns:
         JSON string with spreadsheet information
     """
-    # Access the context through mcp.get_lifespan_context() for resources
-    context = mcp.get_lifespan_context()
-    sheets_service = context.sheets_service
+    fastapi_request = mcp.get_fastapi_request()
+    x_user_id = fastapi_request.headers.get("X-User-ID")
+    sheets_service = create_sheets_service(x_user_id)
     
     # Get spreadsheet metadata
     spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
@@ -667,9 +690,9 @@ def create_spreadsheet(title: str, ctx: Context = None) -> Dict[str, Any]:
     Returns:
         Information about the newly created spreadsheet including its ID
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
-    drive_service = ctx.request_context.lifespan_context.drive_service
-    folder_id = ctx.request_context.lifespan_context.folder_id
+    sheets_service = create_sheets_service()
+    drive_service = create_drive_service()
+    folder_id = None # ctx.request_context.lifespan_context.folder_id
     
     # Create the spreadsheet using Sheets API
     spreadsheet_body = {
@@ -732,7 +755,7 @@ def create_sheet(spreadsheet_id: str,
     Returns:
         Information about the newly created sheet
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = create_sheets_service()
     
     # Define the add sheet request
     request_body = {
@@ -773,8 +796,8 @@ def list_spreadsheets(ctx: Context = None) -> List[Dict[str, str]]:
     Returns:
         List of spreadsheets with their ID and title
     """
-    drive_service = ctx.request_context.lifespan_context.drive_service
-    folder_id = ctx.request_context.lifespan_context.folder_id
+    drive_service = create_drive_service()
+    folder_id = None # ctx.request_context.lifespan_context.folder_id
     
     query = "mimeType='application/vnd.google-apps.spreadsheet'"
     
@@ -820,7 +843,7 @@ def share_spreadsheet(spreadsheet_id: str,
         A dictionary containing lists of 'successes' and 'failures'. 
         Each item in the lists includes the email address and the outcome.
     """
-    drive_service = ctx.request_context.lifespan_context.drive_service
+    drive_service = create_drive_service()
     successes = []
     failures = []
     
